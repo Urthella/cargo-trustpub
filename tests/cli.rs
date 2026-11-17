@@ -43,48 +43,102 @@ fn newest(name: &str) -> String {
 
 struct FakeRegistry {
     url: String,
+    /// The same server, answering for GitHub's API.
+    github_url: String,
     agents: Arc<Mutex<Vec<String>>>,
     times: Arc<Mutex<Vec<Instant>>>,
     limited: Arc<AtomicUsize>,
+    /// How GitHub answers: one of the GITHUB_* modes.
+    github: Arc<AtomicUsize>,
+    /// The Authorization headers GitHub was sent, one per request.
+    authorizations: Arc<Mutex<Vec<String>>>,
+}
+
+const GITHUB_REAL: usize = 0;
+const GITHUB_OTHER_COMMIT: usize = 1;
+const GITHUB_OTHER_REPOSITORY: usize = 2;
+const GITHUB_NOT_FOUND: usize = 3;
+const GITHUB_RATE_LIMITED: usize = 4;
+
+/// A GitHub run, from the saved ones and changed as the mode says.
+fn github_run(mode: usize, run_id: &str) -> (&'static str, String) {
+    let Ok(text) = std::fs::read_to_string(format!("{FIXTURES}/github-run-{run_id}.json")) else {
+        return ("404 Not Found", r#"{"message":"Not Found"}"#.into());
+    };
+    let mut run: serde_json::Value = serde_json::from_str(&text).unwrap();
+    match mode {
+        GITHUB_OTHER_COMMIT => run["head_sha"] = "0".repeat(40).into(),
+        GITHUB_OTHER_REPOSITORY => run["repository"]["full_name"] = "someone/else".into(),
+        GITHUB_NOT_FOUND => return ("404 Not Found", r#"{"message":"Not Found"}"#.into()),
+        GITHUB_RATE_LIMITED => {
+            return (
+                "403 Forbidden",
+                r#"{"message":"API rate limit exceeded"}"#.into(),
+            );
+        }
+        _ => {}
+    }
+    ("200 OK", run.to_string())
 }
 
 /// Serves /api/v1/crates/NAME from the fixtures, 404 for anything else, and a 429 for the next
-/// `limited` requests.
+/// `limited` requests; and GitHub's /repos/OWNER/REPO/actions/runs/ID from the saved runs.
 fn registry() -> FakeRegistry {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let address = listener.local_addr().unwrap();
+    let (url, github_url) = (
+        format!("http://{address}/api/v1"),
+        format!("http://{address}"),
+    );
     let agents = Arc::new(Mutex::new(Vec::new()));
     let times = Arc::new(Mutex::new(Vec::new()));
     let limited = Arc::new(AtomicUsize::new(0));
-    let (a, t, l) = (agents.clone(), times.clone(), limited.clone());
+    let github = Arc::new(AtomicUsize::new(GITHUB_REAL));
+    let authorizations = Arc::new(Mutex::new(Vec::new()));
+    let (a, t, l, g, z) = (
+        agents.clone(),
+        times.clone(),
+        limited.clone(),
+        github.clone(),
+        authorizations.clone(),
+    );
     thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
+            let mut authorization = String::new();
             loop {
                 let mut header = String::new();
                 reader.read_line(&mut header).unwrap();
-                if let Some(agent) = header
-                    .strip_prefix("user-agent: ")
-                    .or_else(|| header.strip_prefix("User-Agent: "))
-                {
-                    a.lock().unwrap().push(agent.trim().to_string());
+                if let Some((name, value)) = header.split_once(':') {
+                    match name.to_ascii_lowercase().as_str() {
+                        "user-agent" => a.lock().unwrap().push(value.trim().to_string()),
+                        "authorization" => authorization = value.trim().to_string(),
+                        _ => {}
+                    }
                 }
                 if header.trim().is_empty() {
                     break;
                 }
             }
-            t.lock().unwrap().push(Instant::now());
             let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
-            let (status, body) = if l.load(Ordering::SeqCst) > 0 {
+            let (status, body) = if path.starts_with("/repos/") {
+                z.lock().unwrap().push(authorization);
+                github_run(
+                    g.load(Ordering::SeqCst),
+                    path.rsplit('/').next().unwrap_or(""),
+                )
+            } else if l.load(Ordering::SeqCst) > 0 {
+                t.lock().unwrap().push(Instant::now());
                 l.fetch_sub(1, Ordering::SeqCst);
                 (
                     "429 Too Many Requests\r\nRetry-After: 0",
                     "slow down".to_string(),
                 )
             } else {
+                t.lock().unwrap().push(Instant::now());
                 match path.strip_prefix("/api/v1/crates/").and_then(|name| {
                     std::fs::read_to_string(format!("{FIXTURES}/{name}.json")).ok()
                 }) {
@@ -104,9 +158,12 @@ fn registry() -> FakeRegistry {
     });
     FakeRegistry {
         url,
+        github_url,
         agents,
         times,
         limited,
+        github,
+        authorizations,
     }
 }
 
@@ -366,4 +423,150 @@ fn runs_as_a_cargo_subcommand_and_rejects_bad_arguments() {
     assert!(
         String::from_utf8_lossy(&missing.stderr).starts_with("cargo-trustpub: no/such/Cargo.lock")
     );
+}
+
+/// rand's and jiff's newest versions, both published with Trusted Publishing.
+fn trusted_lockfile() -> (tempfile_path::Path, String) {
+    let jiff = newest("jiff");
+    (
+        lockfile(&[("jiff", &jiff, None), ("rand", &newest("rand"), None)]),
+        jiff,
+    )
+}
+
+fn run_github(
+    registry: &FakeRegistry,
+    lock: &tempfile_path::Path,
+    token: Option<&str>,
+) -> (i32, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-trustpub"));
+    command
+        .args([
+            "--api",
+            &registry.url,
+            "--github-api",
+            &registry.github_url,
+            "--interval",
+            "0",
+            "--github",
+            "--all",
+            "--lockfile",
+        ])
+        .arg(&lock.0);
+    command.env_remove("GITHUB_TOKEN").env_remove("GH_TOKEN");
+    if let Some(token) = token {
+        command.env("GITHUB_TOKEN", token);
+    }
+    let output = command.output().unwrap();
+    (
+        output.status.code().unwrap(),
+        String::from_utf8_lossy(&output.stdout).to_string()
+            + &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// jiff's newest version's run, as crates.io recorded it.
+fn jiff_run() -> String {
+    let record = record("jiff");
+    let jiff = newest("jiff");
+    record["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["num"] == jiff.as_str())
+        .unwrap()["trustpub_data"]["run_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn github_confirms_each_run_built_the_recorded_commit() {
+    let registry = registry();
+    let (lock, jiff) = trusted_lockfile();
+    let (code, out) = run_github(&registry, &lock, Some("t0ken"));
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("GitHub: 2 of 2 Trusted Publishing runs built the commit crates.io has"),
+        "{out}"
+    );
+    let workflow = record(&format!("github-run-{}", jiff_run()))["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        out.contains(&format!("run {}, {workflow}\n", jiff_run())),
+        "the workflow file is named: {out}"
+    );
+    assert!(out.contains(&format!("trusted  jiff {jiff}")), "{out}");
+    assert_eq!(
+        *registry.authorizations.lock().unwrap(),
+        ["Bearer t0ken", "Bearer t0ken"],
+        "GITHUB_TOKEN is sent"
+    );
+}
+
+#[test]
+fn a_run_that_built_another_commit_or_belongs_elsewhere_fails() {
+    let registry = registry();
+    let (lock, jiff) = trusted_lockfile();
+    registry.github.store(GITHUB_OTHER_COMMIT, Ordering::SeqCst);
+    let (code, out) = run_github(&registry, &lock, None);
+    assert_eq!(code, 1, "{out}");
+    let zeros = "0".repeat(40);
+    assert!(
+        out.contains(&format!("FAIL  jiff {jiff}: on GitHub, the run crates.io recorded, BurntSushi/jiff {}, built {zeros}, not the commit crates.io has", jiff_run())),
+        "{out}"
+    );
+    assert!(
+        out.contains("GitHub: 0 of 2 Trusted Publishing runs built the commit crates.io has"),
+        "{out}"
+    );
+    assert!(
+        registry
+            .authorizations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(String::is_empty),
+        "no token, no Authorization header"
+    );
+
+    registry
+        .github
+        .store(GITHUB_OTHER_REPOSITORY, Ordering::SeqCst);
+    let (code, out) = run_github(&registry, &lock, None);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains(&format!("FAIL  jiff {jiff}: on GitHub, the run crates.io recorded, BurntSushi/jiff {}, belongs to someone/else", jiff_run())), "{out}");
+}
+
+#[test]
+fn a_missing_run_is_a_note_and_a_rate_limit_an_error() {
+    let registry = registry();
+    let (lock, jiff) = trusted_lockfile();
+    registry.github.store(GITHUB_NOT_FOUND, Ordering::SeqCst);
+    let (code, out) = run_github(&registry, &lock, None);
+    assert_eq!(code, 0, "maintainers can delete runs: {out}");
+    assert!(out.contains(&format!("note  jiff {jiff}: GitHub has no record of the run crates.io recorded, BurntSushi/jiff {}", jiff_run())), "{out}");
+
+    registry.github.store(GITHUB_RATE_LIMITED, Ordering::SeqCst);
+    let (code, out) = run_github(&registry, &lock, None);
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        out.contains("ERROR jiff") && out.contains("rate limited by GitHub; set GITHUB_TOKEN"),
+        "{out}"
+    );
+}
+
+#[test]
+fn github_is_only_asked_with_the_flag() {
+    let registry = registry();
+    let (lock, _) = trusted_lockfile();
+    let (code, out) = run(&registry, &lock, &["--all"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        registry.authorizations.lock().unwrap().is_empty(),
+        "no request reached GitHub"
+    );
+    assert!(!out.contains("GitHub:"), "{out}");
 }
