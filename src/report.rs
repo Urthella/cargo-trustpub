@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+use crate::github::RunCheck;
 use crate::lockfile::Locked;
 use crate::registry::{TrustPub, Version};
 
@@ -33,6 +34,9 @@ pub struct Entry {
     /// Whether Cargo.lock's checksum is crates.io's; unknown when the lockfile has none.
     pub checksum_matches: Option<bool>,
     pub yanked: bool,
+    /// With `--github`, what GitHub says about the run behind a Trusted Publishing release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github: Option<RunCheck>,
     pub error: Option<String>,
 }
 
@@ -46,6 +50,7 @@ impl Entry {
             back_to_token: None,
             checksum_matches: None,
             yanked: false,
+            github: None,
             error: Some(error),
         }
     }
@@ -90,18 +95,21 @@ pub fn assess(locked: &Locked, versions: &[Version]) -> Entry {
         back_to_token,
         checksum_matches: locked.checksum.as_ref().map(|c| c == &this.checksum),
         yanked: this.yanked,
+        github: None,
         error: None,
     }
 }
 
-/// 2 when something couldn't be checked, 1 when a version went back to a token or a checksum is wrong, else 0.
+/// 2 when something couldn't be checked; 1 when a version went back to a token, a checksum is
+/// wrong, or GitHub contradicts crates.io; else 0.
 pub fn exit_code(entries: &[Entry]) -> i32 {
     if entries.iter().any(|e| e.error.is_some()) {
         2
-    } else if entries
-        .iter()
-        .any(|e| e.back_to_token.is_some() || e.checksum_matches == Some(false))
-    {
+    } else if entries.iter().any(|e| {
+        e.back_to_token.is_some()
+            || e.checksum_matches == Some(false)
+            || e.github.as_ref().is_some_and(RunCheck::fails)
+    }) {
         1
     } else {
         0
@@ -155,6 +163,29 @@ pub fn describe(entries: &[Entry], all: bool) -> String {
         if e.yanked {
             lines.push(format!("  note  {} {} is yanked", e.name, e.version));
         }
+        let run = match &e.how {
+            Some(How::TrustedPublishing { data }) => format!(
+                "the run crates.io recorded, {} {}",
+                data.source(),
+                data.run_id.as_deref().unwrap_or("?")
+            ),
+            _ => String::new(),
+        };
+        match &e.github {
+            Some(RunCheck::OtherCommit { built }) => lines.push(format!(
+                "  FAIL  {} {}: on GitHub, {run}, built {built}, not the commit crates.io has",
+                e.name, e.version
+            )),
+            Some(RunCheck::OtherRepository { repository }) => lines.push(format!(
+                "  FAIL  {} {}: on GitHub, {run}, belongs to {repository}",
+                e.name, e.version
+            )),
+            Some(RunCheck::NotFound) => lines.push(format!(
+                "  note  {} {}: GitHub has no record of {run}",
+                e.name, e.version
+            )),
+            _ => {}
+        }
     }
     let checked = entries
         .iter()
@@ -167,6 +198,16 @@ pub fn describe(entries: &[Entry], all: bool) -> String {
     lines.push(format!(
         "  checksums: {matching} of {checked} match crates.io"
     ));
+    let asked = entries.iter().filter(|e| e.github.is_some()).count();
+    if asked > 0 {
+        let confirmed = entries
+            .iter()
+            .filter(|e| matches!(e.github, Some(RunCheck::Confirmed { .. })))
+            .count();
+        lines.push(format!(
+            "  GitHub: {confirmed} of {asked} Trusted Publishing runs built the commit crates.io has"
+        ));
+    }
     if all {
         for e in entries {
             let line = match &e.how {
@@ -181,8 +222,12 @@ pub fn describe(entries: &[Entry], all: bool) -> String {
                         .as_deref()
                         .map(|r| format!(", run {r}"))
                         .unwrap_or_default();
+                    let workflow = match &e.github {
+                        Some(RunCheck::Confirmed { workflow }) => format!(", {workflow}"),
+                        _ => String::new(),
+                    };
                     format!(
-                        "  trusted  {} {}  {} {}{at}{run}",
+                        "  trusted  {} {}  {} {}{at}{run}{workflow}",
                         e.name,
                         e.version,
                         data.provider,

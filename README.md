@@ -58,6 +58,12 @@ Options:
 
 - `--lockfile PATH` reads another lockfile than `./Cargo.lock`.
 - `--json` prints every entry as JSON, Trusted Publishing details included.
+- `--github` asks GitHub for a second opinion on each Trusted Publishing release from GitHub.
+  The workflow run crates.io recorded must be in the repository it names and must have built
+  the commit it names; the report then names the workflow file. A run that built another
+  commit, or belongs to another repository, fails. A run GitHub no longer has is noted, since
+  maintainers can delete runs. Public repositories' runs can be read without a token, up to 60
+  an hour; with `GITHUB_TOKEN` or `GH_TOKEN` set, it's 5,000.
 - `--contact EMAIL` adds an address to the User-Agent. crates.io's
   [data access policy](https://crates.io/data-access) asks API clients to say who they are.
 - `--interval MS` spaces requests, 1,000 ms by default, which is the policy's limit; it's there
@@ -80,6 +86,9 @@ checksum that doesn't match, and 2 when a package couldn't be checked.
      than semver, so a backport on an old branch counts too;
    - whether Cargo.lock's checksum is crates.io's;
    - whether it's yanked, which is noted but doesn't fail.
+4. **With `--github`, asks GitHub about each run** at `/repos/OWNER/REPO/actions/runs/ID`. It
+   compares the run's `head_sha` with the commit crates.io recorded, and the run's repository
+   with the one it named, ignoring case as GitHub does.
 
 ## How it's checked
 
@@ -97,17 +106,25 @@ checksum that doesn't match, and 2 when a package couldn't be checked.
   - a 429 is retried with `--contact` in the User-Agent, and requests keep the interval;
   - two versions of one crate share one request;
   - it runs as `cargo trustpub`, and bad arguments exit 2.
-- **Mutation testing.** Seventeen deliberate bugs were planted one at a time, and the tests caught
+- **`--github` against real runs.** The same fake server answers for GitHub with the runs behind
+  rand's and jiff's newest releases, saved from GitHub:
+  - both runs are confirmed, the workflow file is named, and `GITHUB_TOKEN` is sent;
+  - a run that built another commit, or belongs to another repository, fails;
+  - a missing run is a note, a rate limit exits 2, and without the flag GitHub isn't asked.
+- **Mutation testing.** Twenty-six deliberate bugs were planted one at a time, and the tests caught
   every one.
 - **Live.** On its own lockfile, 66 crates.io packages: 7 published with Trusted Publishing, and
   all 66 checksums match crates.io. On ripgrep's, 50 packages: 3 trusted, and 50 of 50 checksums.
-  Neither has a token release after Trusted Publishing.
+  Neither has a token release after Trusted Publishing. With `--github`, GitHub confirmed all 7
+  and all 3 runs built the commits crates.io recorded.
 
 ## Limits
 
 - It trusts what crates.io's API says. A checksum match shows the lockfile agrees with crates.io,
   not that crates.io is right.
 - Versions from before crates.io recorded publishers say "publisher not recorded".
+- `--github` checks GitHub's releases only; GitLab's Trusted Publishing records aren't
+  cross-checked.
 - At one request a second, a lockfile with 600 crates takes ten minutes.
 - A flag is a reason to look, not a verdict: most token releases after Trusted Publishing among
   the top crates are maintenance releases on old branches.
